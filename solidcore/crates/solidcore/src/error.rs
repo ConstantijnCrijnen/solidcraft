@@ -1117,7 +1117,9 @@ impl Reason {
     /// comparison detail).
     pub(crate) fn comparison_status(&self) -> i32 {
         match self {
-            Self::Failed(_) | Self::FootPastDomainEnd { .. } | Self::EdgeOffItsFaces { .. } => SM_ERR,
+            Self::Failed(_) | Self::FootPastDomainEnd { .. } | Self::EdgeOffItsFaces { .. } => {
+                SM_ERR
+            }
             Self::Offset(o) => o.comparison_status(),
             Self::Nurbs(n) => n.comparison_status(),
             Self::Boolean(b) => b.comparison_status(),
