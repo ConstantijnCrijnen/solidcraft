@@ -1,0 +1,38 @@
+name: Pinned Trunk download proof
+on:
+  push:
+    branches: [codex/issue-21589-trunk-proof]
+permissions:
+  contents: read
+jobs:
+  checksum:
+    if: github.repository != 'tangency-labs/solidcraft'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      TRUNK_VERSION: v0.21.14
+      TRUNK_SHA256: f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b
+    steps:
+      - name: Verify the pinned archive before extraction
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          archive="$RUNNER_TEMP/trunk.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$TRUNK_SHA256  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$HOME/.local/bin"
+          "$HOME/.local/bin/trunk" --version
+      - name: Reject a truncated archive before extraction
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/trunk.tar.gz"
+          head -c 1024 "$archive" > "$RUNNER_TEMP/truncated.tar.gz"
+          export archive="$RUNNER_TEMP/truncated.tar.gz"
+          export destination="$RUNNER_TEMP/must-not-extract"
+          mkdir -p "$destination"
+          if bash -eo pipefail -c 'echo "$TRUNK_SHA256  $archive" | sha256sum -c -; tar -xzf "$archive" -C "$destination"'; then
+            echo 'A damaged archive passed verification' >&2
+            exit 1
+          fi
+          test ! -e "$destination/trunk"
+          echo 'Damaged archive rejected before extraction'
