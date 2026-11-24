@@ -1,0 +1,176 @@
+# Temporary own-fork proof only; never include this workflow in the upstream PR.
+name: Browser startup before and after proof
+
+on:
+  push:
+    branches: [codex/issue-21589-browser-proof]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  browser-proof:
+    # Fail closed against accidental publication to the upstream repository.
+    if: github.repository != 'tangency-labs/solidcraft'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: issue-21589-browser-proof
+          save-if: false
+      - name: Record resources and prepare timed commands
+        run: |
+          mkdir -p target/browser-proof/logs
+          {
+            git rev-parse HEAD
+            rustc --version
+            cargo --version
+            uname -sm
+            nproc
+            free -h
+            df -h .
+            python3 -c 'from pathlib import Path; assert Path("crates/ui-egui/src/plugins.rs").read_text().count("std::time::Instant") == 7'
+            chrome=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
+            test -n "$chrome"
+            "$chrome" --version
+            echo "CHROME=$chrome" >> "$GITHUB_ENV"
+          } 2>&1 | tee target/browser-proof/logs/environment.log
+          cat > target/browser-proof/timed.py <<'PYTHON'
+          import argparse
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import time
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("label")
+          parser.add_argument("--expected-exit", type=int, default=0)
+          parser.add_argument("--contains")
+          parser.add_argument("command", nargs=argparse.REMAINDER)
+          args = parser.parse_args()
+          command = args.command
+          if command and command[0] == "--":
+              command = command[1:]
+          if not command:
+              parser.error("a command is required")
+          logs = Path(os.environ["GITHUB_WORKSPACE"]) / "target/browser-proof/logs"
+          log = logs / (args.label + ".log")
+          started = time.monotonic()
+          with log.open("w") as out:
+              process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              for line in process.stdout:
+                  print(line, end="", flush=True)
+                  out.write(line)
+              code = process.wait()
+          elapsed = round(time.monotonic() - started, 3)
+          contents = log.read_text()
+          passed = code == args.expected_exit and (args.contains is None or args.contains in contents)
+          result = {"label": args.label, "seconds": elapsed, "exit": code,
+                    "expected_exit": args.expected_exit, "required_text": args.contains, "passed": passed}
+          with (logs / "timings.jsonl").open("a") as out:
+              out.write(json.dumps(result) + "\n")
+          print(json.dumps(result), flush=True)
+          if not passed:
+              sys.exit("Proof failed: wrong exit status or missing required diagnostic")
+          PYTHON
+      - name: Install pinned Trunk
+        env:
+          TRUNK_VERSION: v0.21.14
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build the smoke harness separately from timed browser runs
+        run: python3 target/browser-proof/timed.py harness-build -- cargo build --locked -p xtask
+      - name: Build the affected browser client
+        working-directory: apps/solidcraft-web
+        run: |
+          python3 "$GITHUB_WORKSPACE/target/browser-proof/timed.py" before-build -- \
+            trunk build --cargo-profile ci --public-url ./ --dist "$GITHUB_WORKSPACE/dist/web-before"
+      - name: Require the exact known startup panic
+        run: |
+          python3 target/browser-proof/timed.py --expected-exit 1 \
+            --contains 'time not implemented on this platform' before-smoke -- \
+            target/debug/xtask web-api-test --smoke --site dist/web-before
+      - name: Apply only the seven browser-safe clock replacements in this checkout
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import hashlib
+          import json
+          path = Path("crates/ui-egui/src/plugins.rs")
+          before = path.read_text()
+          old, new = "std::time::Instant", "web_time::Instant"
+          count = before.count(old)
+          if count != 7:
+              raise SystemExit(f"Expected exactly seven unsupported clock references, got {count}")
+          after = before.replace(old, new)
+          assert old not in after and after.count(new) == before.count(new) + 7
+          path.write_text(after)
+          result = {"replacements": count, "before_sha256": hashlib.sha256(before.encode()).hexdigest(),
+                    "after_sha256": hashlib.sha256(after.encode()).hexdigest()}
+          Path("target/browser-proof/logs/clock-replacements.json").write_text(json.dumps(result) + "\n")
+          print(json.dumps(result))
+          PYTHON
+          git diff --check
+          git diff -- crates/ui-egui/src/plugins.rs | tee target/browser-proof/logs/clock-fix.diff
+      - name: Build the corrected browser client with the same profile
+        working-directory: apps/solidcraft-web
+        run: |
+          python3 "$GITHUB_WORKSPACE/target/browser-proof/timed.py" after-build -- \
+            trunk build --cargo-profile ci --public-url ./ --dist "$GITHUB_WORKSPACE/dist/web-after"
+      - name: Require three fresh-profile passes and the full browser API test
+        run: |
+          for attempt in 1 2 3; do
+            python3 target/browser-proof/timed.py "after-smoke-$attempt" -- \
+              target/debug/xtask web-api-test --smoke --site dist/web-after
+          done
+          python3 target/browser-proof/timed.py after-full-api -- \
+            target/debug/xtask web-api-test --site dist/web-after
+      - name: Check the existing offline and update harness
+        run: |
+          python3 target/browser-proof/timed.py after-offline-standin -- \
+            target/debug/xtask web-offline-test
+      - name: Record final resource use and timings
+        if: always()
+        run: |
+          {
+            df -h .
+            du -sh target dist 2>/dev/null || true
+            cat target/browser-proof/logs/timings.jsonl 2>/dev/null || true
+          } | tee target/browser-proof/logs/summary.log
+          {
+            echo '### Browser startup before/after proof'
+            echo 'Only a synthetic 30 x 20 x 10 mm box is used.'
+            echo 'The affected client must fail with the known clock panic.'
+            echo 'The seven clock replacements must pass three fresh-profile smoke runs, the full API test and the offline stand-in test.'
+            echo '```json'
+            cat target/browser-proof/logs/timings.jsonl 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload small proof logs only
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: browser-startup-proof-logs
+          path: target/browser-proof/logs/*
+          if-no-files-found: error
+          retention-days: 7
