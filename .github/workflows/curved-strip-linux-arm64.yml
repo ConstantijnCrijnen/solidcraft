@@ -1,0 +1,62 @@
+name: SolidCore curved strip on Linux ARM64
+
+on:
+  push:
+    branches: [codex/issue-21460-linux-arm64]
+
+permissions:
+  contents: read
+
+jobs:
+  curved-strip:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUST_MIN_STACK: 8388608
+    steps:
+      - name: Check out the reported upstream revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tangency-labs/solidcraft
+          ref: d43e0934fc1837fad94ee0d0df755fe0b33cbd00
+          persist-credentials: false
+      - name: Install matching toolchain
+        uses: dtolnay/rust-toolchain@1.99.1
+      - name: Verify architecture and kernel tree
+        run: |
+          uname -a
+          test "$(uname -m)" = aarch64
+          rustc -vV
+          git rev-parse HEAD HEAD:solidcore
+          test "$(git rev-parse HEAD:solidcore)" = 3e22115eba1c4600789b1ef9be167db33858f606
+      - name: Run the two curved-strip regressions
+        working-directory: solidcore
+        shell: bash
+        run: |
+          set -o pipefail
+          run_case() {
+            local runner="$1"
+            local test_name="$2"
+            local output
+            shift 2
+            output="$(mktemp)"
+            cargo test --locked --profile goldens -p solidcore --features wr57-replay \
+              "$@" "$test_name" -- --exact --nocapture --test-threads=1 \
+              2>&1 | tee "$output"
+            local result="$?"
+            if ! grep -qx 'running 1 test' "$output"; then
+              echo "::error::Expected one test for $runner."
+              return 1
+            fi
+            return "$result"
+          }
+
+          status=0
+          run_case unit \
+            boolean::topology_intersector::curved_strip::tests::the_strip_drop_keeps_the_curve_when_a_check_refuses \
+            --lib || status=1
+          run_case geometry \
+            wr_614_coincident_strip_crossing::curved_strip_join_union_is_one_valid_solid \
+            --test geometry || status=1
+          exit "$status"
